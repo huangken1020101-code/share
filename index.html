@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>遊戲分享平台</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React & ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <!-- Babel -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- 正式連接 Firebase Firestore -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+        import { getFirestore, collection, getDocs, addDoc, updateDoc, doc } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+        
+        const firebaseConfig = {
+            apiKey: 'AIzaSyA718QCBHbLYgB6hopPSSgTWUzCfb8pENU',
+            authDomain: 'towerdefense-save.firebaseapp.com',
+            projectId: 'towerdefense-save',
+            storageBucket: 'towerdefense-save.firebasestorage.app',
+            messagingSenderId: '507422966076',
+            appId: '1:507422966076:web:986f6aae8bf4eb672d9e39'
+        };
+        
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+        
+        window.firebaseDB = db;
+        window.firebaseAPI = { collection, getDocs, addDoc, updateDoc, doc };
+    </script>
+</head>
+<body class="bg-gray-100 min-h-screen">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+        const MAX_IMAGE_SIZE = 5 * 1024 * 1024;
+        const CLOUDINARY_CLOUD_NAME = "zey1dc4y";
+        const CLOUDINARY_UPLOAD_PRESET = "game_share_images";
+        const IMAGE_EXTENSIONS = {
+            "image/jpeg": "jpg",
+            "image/png": "png",
+            "image/webp": "webp",
+            "image/gif": "gif"
+        };
+
+        const uploadGameImage = async (file) => {
+            if (!file) return null;
+            if (!IMAGE_EXTENSIONS[file.type]) {
+                throw new Error("圖片格式僅支援 JPG、PNG、WebP 或 GIF。");
+            }
+            if (file.size >= MAX_IMAGE_SIZE) {
+                throw new Error("圖片大小必須小於 5 MB。");
+            }
+
+            const formData = new FormData();
+            formData.append("file", file);
+            formData.append("upload_preset", CLOUDINARY_UPLOAD_PRESET);
+
+            const response = await fetch(
+                `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`,
+                { method: "POST", body: formData }
+            );
+            const result = await response.json();
+            if (!response.ok) {
+                throw new Error(result.error?.message || `Cloudinary 上傳失敗（HTTP ${response.status}）。`);
+            }
+            if (!result.secure_url) {
+                throw new Error("Cloudinary 未回傳圖片網址，請檢查 Upload preset 設定。");
+            }
+            return result.secure_url;
+        };
+
+        const ImageUploadField = ({ file, onFileChange, currentImage, inputId }) => {
+            const [previewUrl, setPreviewUrl] = useState("");
+
+            useEffect(() => {
+                if (!file) {
+                    setPreviewUrl("");
+                    return;
+                }
+                const url = URL.createObjectURL(file);
+                setPreviewUrl(url);
+                return () => URL.revokeObjectURL(url);
+            }, [file]);
+
+            return (
+                <div className="space-y-2">
+                    <label htmlFor={inputId} className="block text-sm font-medium text-gray-700">遊戲示意圖（選擇圖片直接上傳，需小於 5 MB）</label>
+                    <input
+                        id={inputId}
+                        type="file"
+                        accept="image/jpeg,image/png,image/webp,image/gif"
+                        className="border p-2 w-full rounded"
+                        onChange={e => onFileChange(e.target.files[0] || null)}
+                    />
+                    <p className="text-xs text-gray-500">圖片會透過 Cloudinary Unsigned Upload preset 上傳；請在 preset 限制圖片格式與大小。頁面上的 Email 登入僅供顯示名稱使用。</p>
+                    {(previewUrl || currentImage) && (
+                        <div className="flex items-start gap-3">
+                            <img src={previewUrl || currentImage} alt="圖片預覽" className="w-24 h-16 object-cover rounded border" />
+                            {file && (
+                                <button
+                                    type="button"
+                                    onClick={() => {
+                                        onFileChange(null);
+                                        document.getElementById(inputId).value = "";
+                                    }}
+                                    className="text-sm text-red-600 hover:underline"
+                                >
+                                    移除選取圖片
+                                </button>
+                            )}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const CommentBlock = ({ comment, currentUser, onReply }) => {
+            const [replyText, setReplyText] = useState("");
+            const [showReplyBox, setShowReplyBox] = useState(false);
+
+            const handleReply = () => {
+                if (!replyText.trim()) return;
+                onReply(comment.id, replyText);
+                setReplyText("");
+                setShowReplyBox(false);
+            };
+
+            return (
+                <div className="border-l-2 border-blue-200 pl-4 mt-3 ml-2">
+                    <div className="bg-white p-3 rounded shadow-sm">
+                        <p className="text-xs text-gray-500 font-bold">{comment.author}</p>
+                        <p className="text-gray-800 mt-1">{comment.text}</p>
+                        {currentUser && (
+                            <button onClick={() => setShowReplyBox(!showReplyBox)} className="text-blue-500 text-sm mt-2 hover:underline">
+                                回覆
+                            </button>
+                        )}
+                        {showReplyBox && (
+                            <div className="mt-2 flex gap-2">
+                                <input type="text" value={replyText} onChange={e => setReplyText(e.target.value)} className="border p-1 rounded flex-1 text-sm" placeholder="輸入回覆..." />
+                                <button onClick={handleReply} className="bg-blue-500 text-white px-3 py-1 rounded text-sm">送出</button>
+                            </div>
+                        )}
+                    </div>
+                    {comment.replies && comment.replies.map(reply => (
+                        <CommentBlock key={reply.id} comment={reply} currentUser={currentUser} onReply={onReply} />
+                    ))}
+                </div>
+            );
+        };
+
+        function App() {
+            const [user, setUser] = useState(null);
+            const [loginInput, setLoginInput] = useState("");
+            const [games, setGames] = useState([]);
+            const [searchQuery, setSearchQuery] = useState("");
+            const [activeGame, setActiveGame] = useState(null);
+            
+            // 發佈遊戲狀態
+            const [showAddGame, setShowAddGame] = useState(false);
+            const [newGameForm, setNewGameForm] = useState({ title: '', url: '', image: '', imageFile: null, description: '', authorKeywords: '' });
+            const [isSavingGame, setIsSavingGame] = useState(false);
+            
+            // 編輯遊戲狀態
+            const [showEditGame, setShowEditGame] = useState(false);
+            const [editGameForm, setEditGameForm] = useState({ id: '', title: '', url: '', image: '', imageFile: null, description: '', authorKeywords: '' });
+            
+            const [newPlayerKw, setNewPlayerKw] = useState("");
+
+            useEffect(() => {
+                const loadGames = async () => {
+                    try {
+                        const { collection, getDocs } = window.firebaseAPI;
+                        const querySnapshot = await getDocs(collection(window.firebaseDB, "games"));
+                        const gamesData = querySnapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                        setGames(gamesData);
+                    } catch (error) {
+                        console.error("讀取錯誤，請確認 Firestore 權限規則設定", error);
+                    }
+                };
+
+                const checkFirebase = setInterval(() => {
+                    if(window.firebaseAPI) {
+                        clearInterval(checkFirebase);
+                        loadGames();
+                    }
+                }, 100);
+            }, []);
+
+            const handleLogin = () => {
+                if (loginInput.endsWith("@gmail.com") || loginInput.endsWith("@st.tc.edu.tw")) {
+                    setUser(loginInput);
+                } else {
+                    alert("請使用 Google 帳號 (@gmail.com) 或 學校帳號 (@st.tc.edu.tw) 登入");
+                }
+            };
+
+            const submitNewGame = async (e) => {
+                e.preventDefault();
+                setIsSavingGame(true);
+                try {
+                    const { collection, addDoc } = window.firebaseAPI;
+                    const gameData = {
+                        title: newGameForm.title,
+                        url: newGameForm.url,
+                        image: await uploadGameImage(newGameForm.imageFile) || 'https://images.unsplash.com/photo-1550745165-9bc0b252726f?w=500&q=80',
+                        description: newGameForm.description,
+                        authorKeywords: newGameForm.authorKeywords.split(/[,，]/).map(k => k.trim()).filter(k => k),
+                        playerKeywords: [],
+                        comments: [],
+                        author: user // 紀錄作者
+                    };
+                    const docRef = await addDoc(collection(window.firebaseDB, "games"), gameData);
+                    setGames([{ id: docRef.id, ...gameData }, ...games]);
+                    setShowAddGame(false);
+                    setNewGameForm({ title: '', url: '', image: '', imageFile: null, description: '', authorKeywords: '' });
+                } catch (error) {
+                    console.error("發佈遊戲失敗", error);
+                    alert(`發佈失敗：${error.message || "請確認 Cloudinary preset 與 Firestore 權限。"}`);
+                } finally {
+                    setIsSavingGame(false);
+                }
+            };
+
+            // 開啟編輯視窗並載入舊資料
+            const openEditModal = () => {
+                setEditGameForm({
+                    id: activeGame.id,
+                    title: activeGame.title,
+                    url: activeGame.url,
+                    image: activeGame.image,
+                    imageFile: null,
+                    description: activeGame.description,
+                    authorKeywords: (activeGame.authorKeywords || []).join(', ')
+                });
+                setShowEditGame(true);
+            };
+
+            // 送出編輯更新
+            const submitEditGame = async (e) => {
+                e.preventDefault();
+                setIsSavingGame(true);
+                try {
+                    const { doc, updateDoc } = window.firebaseAPI;
+                    const updatedData = {
+                        title: editGameForm.title,
+                        url: editGameForm.url,
+                        image: await uploadGameImage(editGameForm.imageFile) || editGameForm.image || 'https://images.unsplash.com/photo-1550745165-9bc0b252726f?w=500&q=80',
+                        description: editGameForm.description,
+                        authorKeywords: editGameForm.authorKeywords.split(/[,，]/).map(k => k.trim()).filter(k => k)
+                    };
+                    
+                    await updateDoc(doc(window.firebaseDB, "games", editGameForm.id), updatedData);
+                    
+                    // 更新本地狀態
+                    const newGames = games.map(g => g.id === editGameForm.id ? { ...g, ...updatedData } : g);
+                    setGames(newGames);
+                    setActiveGame({ ...activeGame, ...updatedData });
+                    setShowEditGame(false);
+                } catch (error) {
+                    console.error("更新遊戲失敗", error);
+                    alert(`更新失敗：${error.message || "請確認 Cloudinary preset 與 Firestore 權限。"}`);
+                } finally {
+                    setIsSavingGame(false);
+                }
+            };
+
+            const handleAddPlayerKeyword = async () => {
+                if (!newPlayerKw.trim() || !user) return;
+                const kw = newPlayerKw.trim();
+                const gameIndex = games.findIndex(g => g.id === activeGame.id);
+                const game = JSON.parse(JSON.stringify(games[gameIndex]));
+                
+                if (!game.playerKeywords) game.playerKeywords = [];
+                if (game.playerKeywords.includes(kw)) return setNewPlayerKw("");
+
+                game.playerKeywords.push(kw);
+                
+                try {
+                    const { doc, updateDoc } = window.firebaseAPI;
+                    await updateDoc(doc(window.firebaseDB, "games", activeGame.id), { playerKeywords: game.playerKeywords });
+                    
+                    const newGames = [...games];
+                    newGames[gameIndex] = game;
+                    setGames(newGames);
+                    setActiveGame(game);
+                    setNewPlayerKw("");
+                } catch (error) {
+                    console.error("更新標籤失敗", error);
+                }
+            };
+
+            const handleAddReply = async (gameId, parentCommentId, text) => {
+                const newComment = { id: Date.now().toString() + Math.random().toString(36).substr(2, 5), author: user, text, replies: [] };
+                const gameIndex = games.findIndex(g => g.id === gameId);
+                const game = JSON.parse(JSON.stringify(games[gameIndex])); 
+                
+                const addReplyToTree = (commentsList) => {
+                    for (let c of commentsList) {
+                        if (c.id === parentCommentId) {
+                            c.replies.push(newComment);
+                            return true;
+                        }
+                        if (c.replies && addReplyToTree(c.replies)) return true;
+                    }
+                    return false;
+                };
+
+                game.comments = game.comments || [];
+                if (parentCommentId === null) {
+                    game.comments.push(newComment);
+                } else {
+                    addReplyToTree(game.comments);
+                }
+                
+                try {
+                    const { doc, updateDoc } = window.firebaseAPI;
+                    await updateDoc(doc(window.firebaseDB, "games", gameId), { comments: game.comments });
+                    
+                    const newGames = [...games];
+                    newGames[gameIndex] = game;
+                    setGames(newGames);
+                    setActiveGame(game);
+                } catch (error) {
+                    console.error("評論失敗", error);
+                }
+            };
+
+            const getSearchResults = () => {
+                if (!searchQuery) return { byName: games, byAuthorKw: [], byPlayerKw: [], byDesc: [] };
+                const q = searchQuery.toLowerCase();
+                return {
+                    byName: games.filter(g => g.title.toLowerCase().includes(q)),
+                    byAuthorKw: games.filter(g => (g.authorKeywords||[]).some(k => k.toLowerCase().includes(q))),
+                    byPlayerKw: games.filter(g => (g.playerKeywords||[]).some(k => k.toLowerCase().includes(q))),
+                    byDesc: games.filter(g => g.description.toLowerCase().includes(q))
+                };
+            };
+            const searchResults = getSearchResults();
+
+            return (
+                <div className="max-w-5xl mx-auto p-4">
+                    <nav className="bg-white p-4 rounded-lg shadow mb-6 flex flex-col md:flex-row justify-between items-center gap-4">
+                        <h1 className="text-2xl font-bold text-blue-600 cursor-pointer" onClick={() => setActiveGame(null)}>🎮 遊戲分享網</h1>
+                        
+                        {!activeGame && (
+                            <input 
+                                type="text" 
+                                placeholder="搜尋遊戲、關鍵字或簡介..." 
+                                className="border p-2 rounded w-full md:w-1/3"
+                                value={searchQuery}
+                                onChange={e => setSearchQuery(e.target.value)}
+                            />
+                        )}
+
+                        <div className="flex items-center gap-4">
+                            {user && <button onClick={() => setShowAddGame(true)} className="bg-green-500 text-white px-4 py-2 rounded text-sm">發佈遊戲</button>}
+                            
+                            {user ? (
+                                <span className="text-gray-700">歡迎, {user} <button onClick={() => setUser(null)} className="ml-2 text-red-500 text-sm">登出</button></span>
+                            ) : (
+                                <div className="flex gap-2">
+                                    <input 
+                                        type="text" 
+                                        placeholder="信箱 (@gmail.com / @st.tc.edu.tw)" 
+                                        className="border p-2 rounded text-sm w-64"
+                                        value={loginInput}
+                                        onChange={e => setLoginInput(e.target.value)}
+                                    />
+                                    <button onClick={handleLogin} className="bg-blue-600 text-white px-4 py-2 rounded">登入</button>
+                                </div>
+                            )}
+                        </div>
+                    </nav>
+
+                    {/* 發佈遊戲彈跳視窗 */}
+                    {showAddGame && (
+                        <div className="fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center p-4 z-50">
+                            <div className="bg-white p-6 rounded-lg w-full max-w-md">
+                                <h2 className="text-xl font-bold mb-4">發佈新遊戲</h2>
+                                <form onSubmit={submitNewGame} className="space-y-3">
+                                    <input required placeholder="遊戲名稱" className="border p-2 w-full rounded" value={newGameForm.title} onChange={e=>setNewGameForm({...newGameForm, title: e.target.value})} />
+                                    <input required placeholder="遊戲網址 (URL)" className="border p-2 w-full rounded" value={newGameForm.url} onChange={e=>setNewGameForm({...newGameForm, url: e.target.value})} />
+                                    <ImageUploadField inputId="new-game-image" file={newGameForm.imageFile} currentImage={newGameForm.image} onFileChange={imageFile => setNewGameForm({...newGameForm, imageFile})} />
+                                    <textarea required placeholder="遊戲簡介" className="border p-2 w-full rounded h-24" value={newGameForm.description} onChange={e=>setNewGameForm({...newGameForm, description: e.target.value})} />
+                                    <input placeholder="作者關鍵字 (用逗號分隔)" className="border p-2 w-full rounded" value={newGameForm.authorKeywords} onChange={e=>setNewGameForm({...newGameForm, authorKeywords: e.target.value})} />
+                                    <div className="flex justify-end gap-2 mt-4">
+                                        <button type="button" onClick={() => setShowAddGame(false)} className="bg-gray-300 px-4 py-2 rounded">取消</button>
+                                        <button type="submit" disabled={isSavingGame} className="bg-blue-600 text-white px-4 py-2 rounded disabled:opacity-50">{isSavingGame ? "圖片上傳中..." : "確認發佈"}</button>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* 編輯遊戲彈跳視窗 */}
+                    {showEditGame && (
+                        <div className="fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center p-4 z-50">
+                            <div className="bg-white p-6 rounded-lg w-full max-w-md">
+                                <h2 className="text-xl font-bold mb-4">編輯遊戲</h2>
+                                <form onSubmit={submitEditGame} className="space-y-3">
+                                    <input required placeholder="遊戲名稱" className="border p-2 w-full rounded" value={editGameForm.title} onChange={e=>setEditGameForm({...editGameForm, title: e.target.value})} />
+                                    <input required placeholder="遊戲網址 (URL)" className="border p-2 w-full rounded" value={editGameForm.url} onChange={e=>setEditGameForm({...editGameForm, url: e.target.value})} />
+                                    <ImageUploadField inputId="edit-game-image" file={editGameForm.imageFile} currentImage={editGameForm.image} onFileChange={imageFile => setEditGameForm({...editGameForm, imageFile})} />
+                                    <textarea required placeholder="遊戲簡介" className="border p-2 w-full rounded h-24" value={editGameForm.description} onChange={e=>setEditGameForm({...editGameForm, description: e.target.value})} />
+                                    <input placeholder="作者關鍵字 (用逗號分隔)" className="border p-2 w-full rounded" value={editGameForm.authorKeywords} onChange={e=>setEditGameForm({...editGameForm, authorKeywords: e.target.value})} />
+                                    <div className="flex justify-end gap-2 mt-4">
+                                        <button type="button" onClick={() => setShowEditGame(false)} className="bg-gray-300 px-4 py-2 rounded">取消</button>
+                                        <button type="submit" disabled={isSavingGame} className="bg-yellow-500 text-white px-4 py-2 rounded disabled:opacity-50">{isSavingGame ? "圖片上傳中..." : "儲存變更"}</button>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+                    )}
+
+                    {activeGame ? (
+                        <div className="bg-white p-6 rounded-lg shadow">
+                            <button onClick={() => setActiveGame(null)} className="text-blue-500 mb-4 hover:underline">← 返回列表</button>
+                            
+                            <img src={activeGame.image} alt={activeGame.title} className="w-full h-64 object-cover rounded-lg mb-4" />
+                            
+                            <div className="flex justify-between items-start mb-2">
+                                <div>
+                                    <h2 className="text-3xl font-bold">{activeGame.title}</h2>
+                                    <p className="text-sm text-gray-500 mt-1">發佈者：{activeGame.author || '匿名'}</p>
+                                </div>
+                                <div className="flex gap-2">
+                                    <a href={activeGame.url} target="_blank" className="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600 text-center">開始遊玩</a>
+                                    {/* 只有作者能看到編輯按鈕 */}
+                                    {user && user === activeGame.author && (
+                                        <button onClick={openEditModal} className="bg-yellow-500 text-white px-4 py-2 rounded hover:bg-yellow-600">編輯遊戲</button>
+                                    )}
+                                </div>
+                            </div>
+                            
+                            <div className="mb-4 mt-4">
+                                <h3 className="font-bold text-gray-700">簡介：</h3>
+                                <p className="text-gray-600 whitespace-pre-wrap">{activeGame.description}</p>
+                            </div>
+                            
+                            <div className="flex flex-col gap-3 mb-6 text-sm border-t pt-4">
+                                <div>
+                                    <span className="font-bold">作者設定關鍵字：</span> 
+                                    {(activeGame.authorKeywords||[]).map(k => <span key={k} className="bg-blue-100 text-blue-800 px-2 py-1 rounded mx-1">{k}</span>)}
+                                </div>
+                                <div className="flex items-center flex-wrap gap-2">
+                                    <span className="font-bold">玩家標籤：</span> 
+                                    {(activeGame.playerKeywords||[]).map(k => <span key={k} className="bg-green-100 text-green-800 px-2 py-1 rounded mx-1">{k}</span>)}
+                                    {user && (
+                                        <div className="flex gap-1 ml-2">
+                                            <input type="text" value={newPlayerKw} onChange={e=>setNewPlayerKw(e.target.value)} placeholder="新增玩家標籤..." className="border rounded px-2 py-1 w-32" />
+                                            <button onClick={handleAddPlayerKeyword} className="bg-green-500 text-white px-2 py-1 rounded">+</button>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+
+                            <hr className="my-6" />
+                            
+                            <h3 className="text-xl font-bold mb-4">玩家評論</h3>
+                            {user ? (
+                                <div className="mb-6 flex gap-2">
+                                    <input type="text" id="mainComment" className="border p-2 rounded w-full" placeholder="寫下你的評論..." />
+                                    <button onClick={() => {
+                                        const input = document.getElementById('mainComment');
+                                        if(input.value.trim()){
+                                            handleAddReply(activeGame.id, null, input.value);
+                                            input.value = '';
+                                        }
+                                    }} className="bg-blue-600 text-white px-4 py-2 rounded">發佈</button>
+                                </div>
+                            ) : (
+                                <p className="text-red-500 mb-6">請先登入以發表評論或新增標籤</p>
+                            )}
+
+                            <div>
+                                {(activeGame.comments||[]).map(comment => (
+                                    <CommentBlock key={comment.id} comment={comment} currentUser={user} onReply={(parentId, text) => handleAddReply(activeGame.id, parentId, text)} />
+                                ))}
+                            </div>
+                        </div>
+                    ) : (
+                        <div>
+                            {searchQuery ? (
+                                <div className="space-y-6">
+                                    {searchResults.byName.length > 0 && <ResultSection title="🎯 遊戲名稱相符" games={searchResults.byName} onSelect={setActiveGame} />}
+                                    {searchResults.byAuthorKw.length > 0 && <ResultSection title="🏷️ 作者關鍵字相符" games={searchResults.byAuthorKw} onSelect={setActiveGame} />}
+                                    {searchResults.byPlayerKw.length > 0 && <ResultSection title="🎮 玩家關鍵字相符" games={searchResults.byPlayerKw} onSelect={setActiveGame} />}
+                                    {searchResults.byDesc.length > 0 && <ResultSection title="📖 簡介相符" games={searchResults.byDesc} onSelect={setActiveGame} />}
+                                    {Object.values(searchResults).every(arr => arr.length === 0) && <p className="text-center text-gray-500 mt-10">找不到相關遊戲</p>}
+                                </div>
+                            ) : (
+                                <ResultSection title="🌟 遊戲列表" games={games} onSelect={setActiveGame} />
+                            )}
+                            {games.length === 0 && !searchQuery && (
+                                <div className="text-center text-gray-500 mt-20">資料庫目前沒有遊戲，請登入後點擊右上角「發佈遊戲」來新增。</div>
+                            )}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        const ResultSection = ({ title, games, onSelect }) => (
+            <div>
+                <h2 className="text-xl font-bold text-gray-800 mb-4">{title}</h2>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                    {games.map(game => (
+                        <div key={game.id} className="bg-white rounded-lg shadow overflow-hidden hover:shadow-lg transition cursor-pointer flex flex-col" onClick={() => onSelect(game)}>
+                            <img src={game.image} className="w-full h-40 object-cover" />
+                            <div className="p-4 flex flex-col flex-grow">
+                                <h3 className="font-bold text-lg">{game.title}</h3>
+                                <p className="text-xs text-blue-500 mb-2">發佈者: {game.author || '匿名'}</p>
+                                <p className="text-gray-600 text-sm truncate">{game.description}</p>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            </div>
+        );
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
