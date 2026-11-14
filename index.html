@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>遊戲分享平台</title>
+    <title>網站分享平台</title>
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- React & ReactDOM -->
@@ -15,7 +15,7 @@
     <!-- 正式連接 Firebase Firestore -->
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
-        import { getFirestore, collection, getDocs, addDoc, updateDoc, doc } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+        import { getFirestore, collection, getDocs, addDoc, updateDoc, doc, getDoc, writeBatch, runTransaction } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
         
         const firebaseConfig = {
             apiKey: 'AIzaSyA718QCBHbLYgB6hopPSSgTWUzCfb8pENU',
@@ -30,7 +30,7 @@
         const db = getFirestore(app);
         
         window.firebaseDB = db;
-        window.firebaseAPI = { collection, getDocs, addDoc, updateDoc, doc };
+        window.firebaseAPI = { collection, getDocs, addDoc, updateDoc, doc, getDoc, writeBatch, runTransaction };
     </script>
 </head>
 <body class="bg-gray-100 min-h-screen">
@@ -46,6 +46,37 @@
             "image/png": "png",
             "image/webp": "webp",
             "image/gif": "gif"
+        };
+        const accountKey = email => encodeURIComponent(email.trim().toLowerCase());
+        const normalizeEmail = email => String(email || "").trim().toLowerCase();
+
+        const getRatingStats = ratings => {
+            const validRatings = (Array.isArray(ratings) ? ratings : []).filter(
+                rating => Number.isInteger(rating.value) && rating.value >= 1 && rating.value <= 5
+            );
+            const total = validRatings.reduce((sum, rating) => sum + rating.value, 0);
+            return {
+                count: validRatings.length,
+                average: validRatings.length ? total / validRatings.length : 0
+            };
+        };
+
+        const renameCommentAuthors = (comments, email, nickname) => {
+            let changed = false;
+            const renamedComments = (comments || []).map(comment => {
+                const authorEmail = normalizeEmail(comment.authorEmail);
+                const isMatchingAuthor = authorEmail
+                    ? authorEmail === email
+                    : normalizeEmail(comment.author) === email;
+                const replies = renameCommentAuthors(comment.replies, email, nickname);
+                if (isMatchingAuthor || replies.changed) changed = true;
+                return {
+                    ...comment,
+                    ...(isMatchingAuthor ? { author: nickname, authorEmail: email } : {}),
+                    ...(replies.changed ? { replies: replies.comments } : {})
+                };
+            });
+            return { comments: renamedComments, changed };
         };
 
         const uploadGameImage = async (file) => {
@@ -155,9 +186,60 @@
             );
         };
 
+        const RatingSection = ({ ratings, currentUser, onRate }) => {
+            const stats = getRatingStats(ratings);
+            const myRating = (ratings || []).find(
+                rating => normalizeEmail(rating.userEmail) === normalizeEmail(currentUser)
+            )?.value || 0;
+
+            return (
+                <section className="border-t border-b py-4 my-5" aria-label="遊戲評分">
+                    <h3 className="font-bold text-gray-700 mb-2">玩家評分</h3>
+                    <p className="text-sm text-gray-600 mb-2">
+                        {stats.count ? `平均 ${stats.average.toFixed(1)} / 5（${stats.count} 人評分）` : "尚無評分"}
+                    </p>
+                    {currentUser ? (
+                        <>
+                            <div className="flex items-center gap-1" role="group" aria-label="選擇 1 到 5 星">
+                                {[1, 2, 3, 4, 5].map(score => (
+                                    <button
+                                        key={score}
+                                        type="button"
+                                        onClick={() => onRate(score)}
+                                        aria-label={`${score} 星`}
+                                        aria-pressed={myRating === score}
+                                        title={`${score} 星`}
+                                        className={`text-2xl ${score <= myRating ? "text-yellow-500" : "text-gray-300"} hover:text-yellow-500`}
+                                    >
+                                        ★
+                                    </button>
+                                ))}
+                                <span className="ml-2 text-sm text-gray-600">
+                                    {myRating ? `你的評分：${myRating} 星（可再次點選修改）` : "點選星星評分"}
+                                </span>
+                            </div>
+                        </>
+                    ) : (
+                        <p className="text-sm text-gray-500">登入後即可評分。</p>
+                    )}
+                </section>
+            );
+        };
+
         function App() {
             const [user, setUser] = useState(null);
             const [loginInput, setLoginInput] = useState("");
+            const [loginPassword, setLoginPassword] = useState("");
+            const [accountData, setAccountData] = useState({ nickname: "", password: "", hidePasswordPrompt: false });
+            const [isLoggingIn, setIsLoggingIn] = useState(false);
+            const [showPasswordSetup, setShowPasswordSetup] = useState(false);
+            const [setupPassword, setSetupPassword] = useState("");
+            const [hidePasswordPrompt, setHidePasswordPrompt] = useState(false);
+            const [showSettings, setShowSettings] = useState(false);
+            const [settingsNickname, setSettingsNickname] = useState("");
+            const [settingsCurrentPassword, setSettingsCurrentPassword] = useState("");
+            const [settingsNewPassword, setSettingsNewPassword] = useState("");
+            const [isSavingSettings, setIsSavingSettings] = useState(false);
             const [games, setGames] = useState([]);
             const [searchQuery, setSearchQuery] = useState("");
             const [activeGame, setActiveGame] = useState(null);
@@ -193,11 +275,189 @@
                 }, 100);
             }, []);
 
-            const handleLogin = () => {
-                if (loginInput.endsWith("@gmail.com") || loginInput.endsWith("@st.tc.edu.tw")) {
-                    setUser(loginInput);
-                } else {
+            const handleLogin = async () => {
+                const email = normalizeEmail(loginInput);
+                if (!email.endsWith("@gmail.com") && !email.endsWith("@st.tc.edu.tw")) {
                     alert("請使用 Google 帳號 (@gmail.com) 或 學校帳號 (@st.tc.edu.tw) 登入");
+                    return;
+                }
+
+                setIsLoggingIn(true);
+                try {
+                    const { getDoc, doc } = window.firebaseAPI;
+                    const accountSnapshot = await getDoc(doc(window.firebaseDB, "userAccounts", accountKey(email)));
+                    const savedAccount = accountSnapshot.exists() ? accountSnapshot.data() : {};
+
+                    if (savedAccount.password && loginPassword !== savedAccount.password) {
+                        alert("密碼錯誤。");
+                        return;
+                    }
+
+                    const nextAccountData = {
+                        nickname: savedAccount.nickname || "",
+                        password: savedAccount.password || "",
+                        hidePasswordPrompt: savedAccount.hidePasswordPrompt === true
+                    };
+                    setUser(email);
+                    setAccountData(nextAccountData);
+                    setLoginPassword("");
+                    if (!nextAccountData.password && !nextAccountData.hidePasswordPrompt) {
+                        setSetupPassword("");
+                        setHidePasswordPrompt(false);
+                        setShowPasswordSetup(true);
+                    }
+                } catch (error) {
+                    console.error("登入帳號資料讀取失敗", error);
+                    alert(`登入失敗：${error.message || "無法讀取帳號資料，請確認 Firestore 權限。"}`);
+                } finally {
+                    setIsLoggingIn(false);
+                }
+            };
+
+            const skipPasswordSetup = async () => {
+                try {
+                    if (hidePasswordPrompt) {
+                        const { doc, writeBatch } = window.firebaseAPI;
+                        const batch = writeBatch(window.firebaseDB);
+                        batch.set(doc(window.firebaseDB, "userAccounts", accountKey(user)), {
+                            hidePasswordPrompt: true
+                        }, { merge: true });
+                        await batch.commit();
+                        setAccountData({ ...accountData, hidePasswordPrompt: true });
+                    }
+                    setShowPasswordSetup(false);
+                } catch (error) {
+                    console.error("儲存密碼提示設定失敗", error);
+                    alert(`設定儲存失敗：${error.message || "請確認 Firestore 權限。"}`);
+                }
+            };
+
+            const savePasswordSetup = async (e) => {
+                e.preventDefault();
+                if (!setupPassword.trim()) {
+                    alert("請輸入要儲存的密碼值。");
+                    return;
+                }
+                try {
+                    const { doc, writeBatch } = window.firebaseAPI;
+                    const batch = writeBatch(window.firebaseDB);
+                    batch.set(doc(window.firebaseDB, "userAccounts", accountKey(user)), {
+                        password: setupPassword,
+                        nickname: accountData.nickname || "",
+                        hidePasswordPrompt
+                    }, { merge: true });
+                    await batch.commit();
+                    setAccountData({ ...accountData, password: setupPassword, hidePasswordPrompt });
+                    setShowPasswordSetup(false);
+                    setSetupPassword("");
+                } catch (error) {
+                    console.error("設定密碼值失敗", error);
+                    alert(`密碼儲存失敗：${error.message || "請確認 Firestore 權限。"}`);
+                }
+            };
+
+            const openSettings = () => {
+                setSettingsNickname(accountData.nickname || "");
+                setSettingsCurrentPassword("");
+                setSettingsNewPassword("");
+                setShowSettings(true);
+            };
+
+            const saveNickname = async (e) => {
+                e.preventDefault();
+                const nickname = settingsNickname.trim();
+                const email = normalizeEmail(user);
+                if (!nickname) {
+                    alert("暱稱不可空白。");
+                    return;
+                }
+
+                setIsSavingSettings(true);
+                try {
+                    const changedGames = [];
+                    for (const game of games) {
+                        const gameAuthorEmail = normalizeEmail(game.authorEmail);
+                        const isMatchingAuthor = gameAuthorEmail
+                            ? gameAuthorEmail === email
+                            : normalizeEmail(game.author) === email;
+                        const renamedComments = renameCommentAuthors(game.comments, email, nickname);
+                        if (isMatchingAuthor || renamedComments.changed) {
+                            changedGames.push({
+                                id: game.id,
+                                data: {
+                                    ...(isMatchingAuthor ? { author: nickname, authorEmail: email } : {}),
+                                    ...(renamedComments.changed ? { comments: renamedComments.comments } : {})
+                                }
+                            });
+                        }
+                    }
+
+                    if (changedGames.length >= 500) {
+                        throw new Error("符合的舊遊戲/評論資料超過 Firestore 單次批次上限，未儲存任何變更。");
+                    }
+
+                    const { doc, writeBatch } = window.firebaseAPI;
+                    const batch = writeBatch(window.firebaseDB);
+                    batch.set(doc(window.firebaseDB, "userAccounts", accountKey(user)), {
+                        nickname,
+                        hidePasswordPrompt: accountData.hidePasswordPrompt
+                    }, { merge: true });
+                    for (const game of changedGames) {
+                        batch.update(doc(window.firebaseDB, "games", game.id), game.data);
+                    }
+                    await batch.commit();
+
+                    const updatedGames = games.map(game => {
+                        const changed = changedGames.find(item => item.id === game.id);
+                        return changed ? { ...game, ...changed.data } : game;
+                    });
+                    setGames(updatedGames);
+                    if (activeGame) {
+                        const changedActiveGame = changedGames.find(item => item.id === activeGame.id);
+                        if (changedActiveGame) setActiveGame({ ...activeGame, ...changedActiveGame.data });
+                    }
+                    setAccountData({
+                        ...accountData,
+                        nickname
+                    });
+                    alert(`設定已儲存，並更新 ${changedGames.length} 筆舊遊戲/評論資料。`);
+                } catch (error) {
+                    console.error("儲存暱稱失敗", error);
+                    alert(`暱稱儲存失敗：${error.message || "請確認 Firestore 權限。"}`);
+                } finally {
+                    setIsSavingSettings(false);
+                }
+            };
+
+            const savePasswordSetting = async (e) => {
+                e.preventDefault();
+                if (accountData.password && settingsCurrentPassword !== accountData.password) {
+                    alert("目前密碼值不正確。");
+                    return;
+                }
+                if (!settingsNewPassword.trim()) {
+                    alert("請輸入新的密碼值。");
+                    return;
+                }
+
+                setIsSavingSettings(true);
+                try {
+                    const { doc, writeBatch } = window.firebaseAPI;
+                    const batch = writeBatch(window.firebaseDB);
+                    batch.set(doc(window.firebaseDB, "userAccounts", accountKey(user)), {
+                        password: settingsNewPassword,
+                        hidePasswordPrompt: accountData.hidePasswordPrompt
+                    }, { merge: true });
+                    await batch.commit();
+                    setAccountData({ ...accountData, password: settingsNewPassword });
+                    setSettingsCurrentPassword("");
+                    setSettingsNewPassword("");
+                    alert(accountData.password ? "密碼值已更改。" : "密碼值已設定。");
+                } catch (error) {
+                    console.error("儲存密碼值失敗", error);
+                    alert(`密碼值儲存失敗：${error.message || "請確認 Firestore 權限。"}`);
+                } finally {
+                    setIsSavingSettings(false);
                 }
             };
 
@@ -214,7 +474,8 @@
                         authorKeywords: newGameForm.authorKeywords.split(/[,，]/).map(k => k.trim()).filter(k => k),
                         playerKeywords: [],
                         comments: [],
-                        author: user // 紀錄作者
+                        author: accountData.nickname || user,
+                        authorEmail: user
                     };
                     const docRef = await addDoc(collection(window.firebaseDB, "games"), gameData);
                     setGames([{ id: docRef.id, ...gameData }, ...games]);
@@ -296,8 +557,46 @@
                 }
             };
 
+            const handleRateGame = async (score) => {
+                if (!user || !Number.isInteger(score) || score < 1 || score > 5) return;
+                try {
+                    const { doc, runTransaction } = window.firebaseAPI;
+                    const gameRef = doc(window.firebaseDB, "games", activeGame.id);
+                    const updatedRatings = await runTransaction(window.firebaseDB, async transaction => {
+                        const gameSnapshot = await transaction.get(gameRef);
+                        if (!gameSnapshot.exists()) {
+                            throw new Error("找不到這個遊戲，請重新整理頁面。");
+                        }
+                        const gameData = gameSnapshot.data();
+                        const ratings = Array.isArray(gameData.ratings) ? gameData.ratings : [];
+                        const email = normalizeEmail(user);
+                        const nextRatings = ratings.filter(
+                            rating => normalizeEmail(rating.userEmail) !== email
+                        );
+                        nextRatings.push({ userEmail: email, value: score });
+                        transaction.update(gameRef, { ratings: nextRatings });
+                        return nextRatings;
+                    });
+
+                    const updatedGames = games.map(game =>
+                        game.id === activeGame.id ? { ...game, ratings: updatedRatings } : game
+                    );
+                    setGames(updatedGames);
+                    setActiveGame({ ...activeGame, ratings: updatedRatings });
+                } catch (error) {
+                    console.error("儲存評分失敗", error);
+                    alert(`評分失敗：${error.message || "請確認 Firestore 權限後重試。"}`);
+                }
+            };
+
             const handleAddReply = async (gameId, parentCommentId, text) => {
-                const newComment = { id: Date.now().toString() + Math.random().toString(36).substr(2, 5), author: user, text, replies: [] };
+                const newComment = {
+                    id: Date.now().toString() + Math.random().toString(36).substr(2, 5),
+                    author: accountData.nickname || user,
+                    authorEmail: user,
+                    text,
+                    replies: []
+                };
                 const gameIndex = games.findIndex(g => g.id === gameId);
                 const game = JSON.parse(JSON.stringify(games[gameIndex])); 
                 
@@ -363,7 +662,11 @@
                             {user && <button onClick={() => setShowAddGame(true)} className="bg-green-500 text-white px-4 py-2 rounded text-sm">發佈遊戲</button>}
                             
                             {user ? (
-                                <span className="text-gray-700">歡迎, {user} <button onClick={() => setUser(null)} className="ml-2 text-red-500 text-sm">登出</button></span>
+                                <>
+                                    <span className="text-gray-700">歡迎, {accountData.nickname || user}</span>
+                                    <button onClick={openSettings} className="bg-gray-200 px-3 py-2 rounded text-sm">設定</button>
+                                    <button onClick={() => { setUser(null); setAccountData({ nickname: "", password: "", hidePasswordPrompt: false }); }} className="text-red-500 text-sm">登出</button>
+                                </>
                             ) : (
                                 <div className="flex gap-2">
                                     <input 
@@ -373,7 +676,14 @@
                                         value={loginInput}
                                         onChange={e => setLoginInput(e.target.value)}
                                     />
-                                    <button onClick={handleLogin} className="bg-blue-600 text-white px-4 py-2 rounded">登入</button>
+                                    <input
+                                        type="password"
+                                        placeholder="密碼（已設定者必填）"
+                                        className="border p-2 rounded text-sm w-44"
+                                        value={loginPassword}
+                                        onChange={e => setLoginPassword(e.target.value)}
+                                    />
+                                    <button onClick={handleLogin} disabled={isLoggingIn} className="bg-blue-600 text-white px-4 py-2 rounded disabled:opacity-50">{isLoggingIn ? "登入中..." : "登入"}</button>
                                 </div>
                             )}
                         </div>
@@ -419,6 +729,61 @@
                         </div>
                     )}
 
+                    {showPasswordSetup && (
+                        <div className="fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center p-4 z-50">
+                            <div className="bg-white p-6 rounded-lg w-full max-w-md">
+                                <h2 className="text-xl font-bold mb-3">設定密碼值</h2>
+                                <p className="text-sm text-amber-700 mb-4">此密碼只是存檔中的一般文字，不是安全驗證；不要使用任何真實或重複使用的密碼。</p>
+                                <form onSubmit={savePasswordSetup} className="space-y-3">
+                                    <input autoComplete="new-password" type="password" required placeholder="輸入要儲存的密碼值" className="border p-2 w-full rounded" value={setupPassword} onChange={e => setSetupPassword(e.target.value)} />
+                                    <label className="flex items-center gap-2 text-sm text-gray-700">
+                                        <input type="checkbox" checked={hidePasswordPrompt} onChange={e => setHidePasswordPrompt(e.target.checked)} />
+                                        以後不再顯示設定密碼提醒
+                                    </label>
+                                    <div className="flex justify-end gap-2">
+                                        <button type="button" onClick={skipPasswordSetup} className="bg-gray-300 px-4 py-2 rounded">這次略過</button>
+                                        <button type="submit" className="bg-blue-600 text-white px-4 py-2 rounded">儲存密碼值</button>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+                    )}
+
+                    {showSettings && (
+                        <div className="fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center p-4 z-50">
+                            <div className="bg-white p-6 rounded-lg w-full max-w-md">
+                                <h2 className="text-xl font-bold mb-3">帳號設定</h2>
+                                <p className="text-sm text-amber-700 mb-4">密碼以一般文字儲存在存檔中，僅供這個頁面比對，不是安全登入密碼；請勿使用真實密碼。</p>
+                                <form onSubmit={saveNickname} className="space-y-3">
+                                    <h3 className="font-semibold">暱稱</h3>
+                                    <label className="block text-sm font-medium">暱稱
+                                        <input maxLength="40" className="border p-2 w-full rounded mt-1" value={settingsNickname} onChange={e => setSettingsNickname(e.target.value)} />
+                                    </label>
+                                    <button type="submit" disabled={isSavingSettings} className="bg-blue-600 text-white px-4 py-2 rounded disabled:opacity-50">{isSavingSettings ? "儲存中..." : "單獨儲存暱稱"}</button>
+                                </form>
+
+                                <hr className="my-5" />
+
+                                <form onSubmit={savePasswordSetting} className="space-y-3">
+                                    <h3 className="font-semibold">{accountData.password ? "更改密碼值" : "設定密碼值"}</h3>
+                                    {accountData.password && (
+                                        <label className="block text-sm font-medium">目前密碼值
+                                            <input autoComplete="current-password" type="password" className="border p-2 w-full rounded mt-1" value={settingsCurrentPassword} onChange={e => setSettingsCurrentPassword(e.target.value)} />
+                                        </label>
+                                    )}
+                                    <label className="block text-sm font-medium">{accountData.password ? "新密碼值" : "密碼值"}
+                                        <input required autoComplete="new-password" type="password" className="border p-2 w-full rounded mt-1" value={settingsNewPassword} onChange={e => setSettingsNewPassword(e.target.value)} />
+                                    </label>
+                                    <button type="submit" disabled={isSavingSettings} className="bg-indigo-600 text-white px-4 py-2 rounded disabled:opacity-50">{isSavingSettings ? "儲存中..." : accountData.password ? "單獨更改密碼" : "單獨設定密碼"}</button>
+                                </form>
+
+                                <div className="flex justify-end pt-4">
+                                    <button type="button" onClick={() => setShowSettings(false)} className="bg-gray-300 px-4 py-2 rounded">關閉</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
                     {activeGame ? (
                         <div className="bg-white p-6 rounded-lg shadow">
                             <button onClick={() => setActiveGame(null)} className="text-blue-500 mb-4 hover:underline">← 返回列表</button>
@@ -433,7 +798,7 @@
                                 <div className="flex gap-2">
                                     <a href={activeGame.url} target="_blank" className="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600 text-center">開始遊玩</a>
                                     {/* 只有作者能看到編輯按鈕 */}
-                                    {user && user === activeGame.author && (
+                                    {user && normalizeEmail(user) === normalizeEmail(activeGame.authorEmail || activeGame.author) && (
                                         <button onClick={openEditModal} className="bg-yellow-500 text-white px-4 py-2 rounded hover:bg-yellow-600">編輯遊戲</button>
                                     )}
                                 </div>
@@ -443,6 +808,8 @@
                                 <h3 className="font-bold text-gray-700">簡介：</h3>
                                 <p className="text-gray-600 whitespace-pre-wrap">{activeGame.description}</p>
                             </div>
+
+                            <RatingSection ratings={activeGame.ratings} currentUser={user} onRate={handleRateGame} />
                             
                             <div className="flex flex-col gap-3 mb-6 text-sm border-t pt-4">
                                 <div>
@@ -517,6 +884,11 @@
                             <div className="p-4 flex flex-col flex-grow">
                                 <h3 className="font-bold text-lg">{game.title}</h3>
                                 <p className="text-xs text-blue-500 mb-2">發佈者: {game.author || '匿名'}</p>
+                                <p className="text-sm text-yellow-600 mb-2">
+                                    ★ {getRatingStats(game.ratings).count
+                                        ? `${getRatingStats(game.ratings).average.toFixed(1)}（${getRatingStats(game.ratings).count} 人）`
+                                        : "尚無評分"}
+                                </p>
                                 <p className="text-gray-600 text-sm truncate">{game.description}</p>
                             </div>
                         </div>
