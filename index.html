@@ -15,7 +15,7 @@
     <!-- 正式連接 Firebase Firestore -->
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
-        import { getFirestore, collection, getDocs, addDoc, updateDoc, doc, getDoc, writeBatch, runTransaction } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+        import { getFirestore, collection, getDocs, addDoc, updateDoc, doc, getDoc, writeBatch, runTransaction, Timestamp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
         
         const firebaseConfig = {
             apiKey: 'AIzaSyA718QCBHbLYgB6hopPSSgTWUzCfb8pENU',
@@ -30,7 +30,7 @@
         const db = getFirestore(app);
         
         window.firebaseDB = db;
-        window.firebaseAPI = { collection, getDocs, addDoc, updateDoc, doc, getDoc, writeBatch, runTransaction };
+        window.firebaseAPI = { collection, getDocs, addDoc, updateDoc, doc, getDoc, writeBatch, runTransaction, Timestamp };
     </script>
 </head>
 <body class="bg-gray-100 min-h-screen">
@@ -49,6 +49,9 @@
         };
         const accountKey = email => encodeURIComponent(email.trim().toLowerCase());
         const normalizeEmail = email => String(email || "").trim().toLowerCase();
+        const DELETE_GRACE_PERIOD_MS = 3 * 24 * 60 * 60 * 1000;
+        const timestampMillis = value => value && typeof value.toMillis === "function" ? value.toMillis() : 0;
+        const isDeletedSite = site => Boolean(site.deletedAt);
         const normalizeSiteUrl = value => {
             const input = value.trim();
             const url = new URL(/^[a-z][a-z\d+.-]*:/i.test(input) ? input : `https://${input}`);
@@ -56,6 +59,11 @@
                 throw new Error("網址必須使用 http:// 或 https://。");
             }
             return url.href;
+        };
+        const isGeminiShareUrl = value => {
+            const url = String(value || "").trim();
+            return /^https?:\/\/share\.gemini\.google(?:[/:?#]|$)/i.test(url) ||
+                /^https?:\/\/gemini\.google\.com\/share\//i.test(url);
         };
         const getListingManagerEmail = game => {
             if (game.delegation?.status === "accepted") {
@@ -256,9 +264,15 @@
             const [isSavingSettings, setIsSavingSettings] = useState(false);
             const [games, setGames] = useState([]);
             const [hasLoadedGames, setHasLoadedGames] = useState(false);
+            const [currentTime, setCurrentTime] = useState(Date.now());
             const [searchQuery, setSearchQuery] = useState("");
             const [activeGame, setActiveGame] = useState(null);
             const [activeTab, setActiveTab] = useState("game");
+            const [showDeletedSites, setShowDeletedSites] = useState(false);
+            const [showDeleteConfirmation, setShowDeleteConfirmation] = useState(false);
+            const [deleteConfirmationText, setDeleteConfirmationText] = useState("");
+            const [isDeletingSite, setIsDeletingSite] = useState(false);
+            const [restoringSiteId, setRestoringSiteId] = useState("");
             const [showDelegationInbox, setShowDelegationInbox] = useState(false);
             const [isHandlingDelegation, setIsHandlingDelegation] = useState(false);
             
@@ -295,8 +309,14 @@
                 }, 100);
             }, []);
 
+            useEffect(() => {
+                const timer = setInterval(() => setCurrentTime(Date.now()), 60 * 1000);
+                return () => clearInterval(timer);
+            }, []);
+
             const pendingDelegationClaims = user && accountData.password
                 ? games.filter(game =>
+                    !isDeletedSite(game) &&
                     game.delegation?.status === "pending" &&
                     normalizeEmail(game.delegation.originalEmail) === normalizeEmail(user)
                 )
@@ -688,6 +708,87 @@
                 }
             };
 
+            const deleteActiveSite = async (e) => {
+                e.preventDefault();
+                if (!activeGame || !user) return;
+                if (deleteConfirmationText.trim() !== activeGame.title.trim()) {
+                    alert("輸入的網站名稱不符，沒有刪除。");
+                    return;
+                }
+
+                setIsDeletingSite(true);
+                try {
+                    const { doc, runTransaction, Timestamp } = window.firebaseAPI;
+                    const siteRef = doc(window.firebaseDB, "games", activeGame.id);
+                    const now = Date.now();
+                    const deletedSite = await runTransaction(window.firebaseDB, async transaction => {
+                        const snapshot = await transaction.get(siteRef);
+                        if (!snapshot.exists()) throw new Error("找不到這個網站，請重新整理。");
+
+                        const currentSite = snapshot.data();
+                        if (isDeletedSite(currentSite)) throw new Error("這個網站已經在刪除期限內。");
+                        if (getListingManagerEmail(currentSite) !== normalizeEmail(user)) {
+                            throw new Error("只有目前管理者可以刪除此網站。");
+                        }
+
+                        const deletion = {
+                            deletedAt: Timestamp.fromMillis(now),
+                            deletedByEmail: normalizeEmail(user),
+                            purgeAt: Timestamp.fromMillis(now + DELETE_GRACE_PERIOD_MS)
+                        };
+                        transaction.update(siteRef, deletion);
+                        return { ...currentSite, ...deletion };
+                    });
+
+                    setGames(games.map(site => site.id === activeGame.id ? { ...site, ...deletedSite } : site));
+                    setActiveGame(null);
+                    setDeleteConfirmationText("");
+                    setShowDeleteConfirmation(false);
+                    setShowDeletedSites(true);
+                } catch (error) {
+                    console.error("刪除網站失敗", error);
+                    alert(`刪除失敗：${error.message || "請確認 Firestore 權限後重試。"}`);
+                } finally {
+                    setIsDeletingSite(false);
+                }
+            };
+
+            const restoreDeletedSite = async (site) => {
+                if (!user || restoringSiteId) return;
+                setRestoringSiteId(site.id);
+                try {
+                    const { doc, runTransaction, Timestamp } = window.firebaseAPI;
+                    const siteRef = doc(window.firebaseDB, "games", site.id);
+                    const restoredSite = await runTransaction(window.firebaseDB, async transaction => {
+                        const snapshot = await transaction.get(siteRef);
+                        if (!snapshot.exists()) throw new Error("找不到這個網站，可能已超過復原期限或已被刪除。");
+
+                        const currentSite = snapshot.data();
+                        if (!isDeletedSite(currentSite)) throw new Error("這個網站已經復原。");
+                        if (normalizeEmail(currentSite.deletedByEmail) !== normalizeEmail(user)) {
+                            throw new Error("只有刪除者可以復原這個網站。");
+                        }
+                        if (timestampMillis(currentSite.purgeAt) <= Timestamp.now().toMillis()) {
+                            throw new Error("三天復原期限已過，網站無法復原。");
+                        }
+
+                        transaction.update(siteRef, {
+                            deletedAt: null,
+                            deletedByEmail: null,
+                            purgeAt: null
+                        });
+                        return { ...currentSite, deletedAt: null, deletedByEmail: null, purgeAt: null };
+                    });
+
+                    setGames(games.map(item => item.id === site.id ? { ...item, ...restoredSite } : item));
+                } catch (error) {
+                    console.error("復原網站失敗", error);
+                    alert(`復原失敗：${error.message || "請確認 Firestore 權限後重試。"}`);
+                } finally {
+                    setRestoringSiteId("");
+                }
+            };
+
             const handleAddReply = async (gameId, parentCommentId, text) => {
                 const newComment = {
                     id: Date.now().toString() + Math.random().toString(36).substr(2, 5),
@@ -730,8 +831,17 @@
                 }
             };
 
+            const deletedSites = user
+                ? games.filter(site =>
+                    isDeletedSite(site) &&
+                    normalizeEmail(site.deletedByEmail) === normalizeEmail(user) &&
+                    timestampMillis(site.purgeAt) > currentTime
+                )
+                : [];
+            const categoryGames = showDeletedSites
+                ? deletedSites
+                : games.filter(game => !isDeletedSite(game) && (game.type || "game") === activeTab);
             const getSearchResults = () => {
-                const categoryGames = games.filter(game => (game.type || "game") === activeTab);
                 if (!searchQuery) return { byName: categoryGames, byAuthorKw: [], byPlayerKw: [], byDesc: [] };
                 const q = searchQuery.toLowerCase();
                 return {
@@ -742,14 +852,14 @@
                 };
             };
             const searchResults = getSearchResults();
-            const visibleGames = games.filter(game => (game.type || "game") === activeTab);
+            const visibleGames = categoryGames;
 
             return (
                 <div className="max-w-5xl mx-auto p-4">
                     <nav className="bg-white p-4 rounded-lg shadow mb-6 flex flex-col md:flex-row justify-between items-center gap-4">
-                        <h1 className="text-2xl font-bold text-blue-600 cursor-pointer" onClick={() => setActiveGame(null)}>網站分享平台</h1>
+                        <h1 className="text-2xl font-bold text-blue-600 cursor-pointer" onClick={() => { setActiveGame(null); setShowDeletedSites(false); setSearchQuery(""); }}>網站分享平台</h1>
                         
-                        {!activeGame && (
+                        {!activeGame && !showDeletedSites && (
                             <input 
                                 type="text" 
                                 placeholder="搜尋網站、關鍵字或簡介..." 
@@ -760,6 +870,18 @@
                         )}
 
                         <div className="flex items-center gap-4">
+                            {user && (
+                                <button
+                                    onClick={() => {
+                                        setActiveGame(null);
+                                        setShowDeletedSites(!showDeletedSites);
+                                        setSearchQuery("");
+                                    }}
+                                    className="bg-gray-200 px-3 py-2 rounded text-sm"
+                                >
+                                    {showDeletedSites ? "返回網站列表" : `已刪除網站（${deletedSites.length}）`}
+                                </button>
+                            )}
                             {user && pendingDelegationClaims.length > 0 && (
                                 <button onClick={() => setShowDelegationInbox(true)} className="bg-amber-100 text-amber-800 px-3 py-2 rounded text-sm">
                                     待處理代發（{pendingDelegationClaims.length}）
@@ -771,7 +893,7 @@
                                 <>
                                     <span className="text-gray-700">歡迎, {accountData.nickname || user}</span>
                                     <button onClick={openSettings} className="bg-gray-200 px-3 py-2 rounded text-sm">設定</button>
-                                    <button onClick={() => { setUser(null); setAccountData({ nickname: "", password: "", hidePasswordPrompt: false }); }} className="text-red-500 text-sm">登出</button>
+                                    <button onClick={() => { setUser(null); setAccountData({ nickname: "", password: "", hidePasswordPrompt: false }); setShowDeletedSites(false); }} className="text-red-500 text-sm">登出</button>
                                 </>
                             ) : (
                                 <div className="flex gap-2">
@@ -795,13 +917,13 @@
                         </div>
                     </nav>
 
-                    {!activeGame && (
+                    {!activeGame && !showDeletedSites && (
                         <div className="flex gap-2 mb-6" role="tablist" aria-label="網站分類">
                             <button
                                 type="button"
                                 role="tab"
                                 aria-selected={activeTab === "game"}
-                                onClick={() => setActiveTab("game")}
+                                onClick={() => { setShowDeletedSites(false); setActiveTab("game"); }}
                                 className={`px-4 py-2 rounded ${activeTab === "game" ? "bg-blue-600 text-white" : "bg-white text-gray-700"}`}
                             >
                                 遊戲網站
@@ -810,7 +932,7 @@
                                 type="button"
                                 role="tab"
                                 aria-selected={activeTab === "function"}
-                                onClick={() => setActiveTab("function")}
+                                onClick={() => { setShowDeletedSites(false); setActiveTab("function"); }}
                                 className={`px-4 py-2 rounded ${activeTab === "function" ? "bg-blue-600 text-white" : "bg-white text-gray-700"}`}
                             >
                                 功能網站
@@ -871,6 +993,36 @@
                                     <div className="flex justify-end gap-2 mt-4">
                                         <button type="button" onClick={() => setShowEditGame(false)} className="bg-gray-300 px-4 py-2 rounded">取消</button>
                                         <button type="submit" disabled={isSavingGame} className="bg-yellow-500 text-white px-4 py-2 rounded disabled:opacity-50">{isSavingGame ? "圖片上傳中..." : "儲存變更"}</button>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+                    )}
+
+                    {showDeleteConfirmation && activeGame && (
+                        <div className="fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center p-4 z-[60]">
+                            <div className="bg-white p-6 rounded-lg w-full max-w-md">
+                                <h2 className="text-xl font-bold mb-3 text-red-700">確認刪除網站</h2>
+                                <p className="text-sm text-gray-700 mb-2">網站會立即從一般列表隱藏。你可以在三天內從「已刪除網站」復原；逾期後將無法透過網站復原，但資料仍會保留在 Firestore，需手動清除。</p>
+                                <p className="font-semibold mb-3">請輸入網站名稱：<span className="text-red-700">{activeGame.title}</span></p>
+                                <form onSubmit={deleteActiveSite} className="space-y-3">
+                                    <input
+                                        autoComplete="off"
+                                        required
+                                        className="border p-2 w-full rounded"
+                                        placeholder="輸入完整網站名稱"
+                                        value={deleteConfirmationText}
+                                        onChange={e => setDeleteConfirmationText(e.target.value)}
+                                    />
+                                    <div className="flex justify-end gap-2">
+                                        <button type="button" onClick={() => setShowDeleteConfirmation(false)} className="bg-gray-300 px-4 py-2 rounded">取消</button>
+                                        <button
+                                            type="submit"
+                                            disabled={isDeletingSite || deleteConfirmationText.trim() !== activeGame.title.trim()}
+                                            className="bg-red-600 text-white px-4 py-2 rounded disabled:opacity-50"
+                                        >
+                                            {isDeletingSite ? "刪除中..." : "確認刪除"}
+                                        </button>
                                     </div>
                                 </form>
                             </div>
@@ -979,10 +1131,30 @@
                                     </p>
                                 </div>
                                 <div className="flex gap-2">
-                                    <a href={activeGame.url} target="_blank" rel="noopener noreferrer" className="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600 text-center">{(activeGame.type || "game") === "game" ? "開始遊玩" : "開啟網站"}</a>
+                                    <a
+                                        href={activeGame.url}
+                                        target={isGeminiShareUrl(activeGame.url) ? "_self" : "_blank"}
+                                        rel="noopener noreferrer"
+                                        className="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600 text-center"
+                                    >
+                                        {isGeminiShareUrl(activeGame.url)
+                                            ? "開啟 Gemini 分享"
+                                            : (activeGame.type || "game") === "game" ? "開始遊玩" : "開啟網站"}
+                                    </a>
                                     {/* 只有作者能看到編輯按鈕 */}
                                     {user && normalizeEmail(user) === getListingManagerEmail(activeGame) && (
-                                        <button onClick={openEditModal} className="bg-yellow-500 text-white px-4 py-2 rounded hover:bg-yellow-600">編輯網站</button>
+                                        <>
+                                            <button onClick={openEditModal} className="bg-yellow-500 text-white px-4 py-2 rounded hover:bg-yellow-600">編輯網站</button>
+                                            <button
+                                                onClick={() => {
+                                                    setDeleteConfirmationText("");
+                                                    setShowDeleteConfirmation(true);
+                                                }}
+                                                className="bg-red-600 text-white px-4 py-2 rounded hover:bg-red-700"
+                                            >
+                                                刪除網站
+                                            </button>
+                                        </>
                                     )}
                                 </div>
                             </div>
@@ -1031,6 +1203,36 @@
                                         }
                                     }} className="bg-blue-600 text-white px-4 py-2 rounded">發佈</button>
                                 </div>
+                            ) : showDeletedSites ? (
+                                <section className="bg-white p-6 rounded-lg shadow">
+                                    <h2 className="text-xl font-bold mb-2">已刪除網站</h2>
+                                    <p className="text-sm text-gray-600 mb-5">只有你刪除的網站會顯示在這裡。可在三天內復原；逾期後不再提供復原，資料仍保留在 Firestore，需手動清除。</p>
+                                    {!hasLoadedGames ? (
+                                        <p className="text-center text-gray-500 py-10">正在載入網站...</p>
+                                    ) : deletedSites.length ? (
+                                        <div className="space-y-3">
+                                            {deletedSites.map(site => (
+                                                <div key={site.id} className="border rounded-lg p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                                                    <div>
+                                                        <h3 className="font-bold">{site.title}</h3>
+                                                        <p className="text-sm text-gray-600">
+                                                            {Math.ceil((timestampMillis(site.purgeAt) - currentTime) / (24 * 60 * 60 * 1000))} 天後無法復原
+                                                        </p>
+                                                    </div>
+                                                    <button
+                                                        onClick={() => restoreDeletedSite(site)}
+                                                        disabled={restoringSiteId === site.id}
+                                                        className="bg-blue-600 text-white px-4 py-2 rounded disabled:opacity-50"
+                                                    >
+                                                        {restoringSiteId === site.id ? "復原中..." : "復原網站"}
+                                                    </button>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    ) : (
+                                        <p className="text-center text-gray-500 py-10">沒有可復原的網站。</p>
+                                    )}
+                                </section>
                             ) : (
                                 <p className="text-red-500 mb-6">請先登入以發表評論或新增標籤</p>
                             )}
