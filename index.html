@@ -49,6 +49,20 @@
         };
         const accountKey = email => encodeURIComponent(email.trim().toLowerCase());
         const normalizeEmail = email => String(email || "").trim().toLowerCase();
+        const normalizeSiteUrl = value => {
+            const input = value.trim();
+            const url = new URL(/^[a-z][a-z\d+.-]*:/i.test(input) ? input : `https://${input}`);
+            if (!["http:", "https:"].includes(url.protocol)) {
+                throw new Error("網址必須使用 http:// 或 https://。");
+            }
+            return url.href;
+        };
+        const getListingManagerEmail = game => {
+            if (game.delegation?.status === "accepted") {
+                return normalizeEmail(game.delegation.originalEmail);
+            }
+            return normalizeEmail(game.delegation?.delegateEmail || game.authorEmail);
+        };
 
         const getRatingStats = ratings => {
             const validRatings = (Array.isArray(ratings) ? ratings : []).filter(
@@ -241,17 +255,21 @@
             const [settingsNewPassword, setSettingsNewPassword] = useState("");
             const [isSavingSettings, setIsSavingSettings] = useState(false);
             const [games, setGames] = useState([]);
+            const [hasLoadedGames, setHasLoadedGames] = useState(false);
             const [searchQuery, setSearchQuery] = useState("");
             const [activeGame, setActiveGame] = useState(null);
+            const [activeTab, setActiveTab] = useState("game");
+            const [showDelegationInbox, setShowDelegationInbox] = useState(false);
+            const [isHandlingDelegation, setIsHandlingDelegation] = useState(false);
             
             // 發佈遊戲狀態
             const [showAddGame, setShowAddGame] = useState(false);
-            const [newGameForm, setNewGameForm] = useState({ title: '', url: '', image: '', imageFile: null, description: '', authorKeywords: '' });
+            const [newGameForm, setNewGameForm] = useState({ title: '', url: '', type: 'game', image: '', imageFile: null, description: '', authorKeywords: '', isDelegated: false, originalAuthorEmail: '', originalAuthorName: '' });
             const [isSavingGame, setIsSavingGame] = useState(false);
             
             // 編輯遊戲狀態
             const [showEditGame, setShowEditGame] = useState(false);
-            const [editGameForm, setEditGameForm] = useState({ id: '', title: '', url: '', image: '', imageFile: null, description: '', authorKeywords: '' });
+            const [editGameForm, setEditGameForm] = useState({ id: '', title: '', url: '', type: 'game', image: '', imageFile: null, description: '', authorKeywords: '' });
             
             const [newPlayerKw, setNewPlayerKw] = useState("");
 
@@ -262,7 +280,9 @@
                         const querySnapshot = await getDocs(collection(window.firebaseDB, "games"));
                         const gamesData = querySnapshot.docs.map(d => ({ id: d.id, ...d.data() }));
                         setGames(gamesData);
+                        setHasLoadedGames(true);
                     } catch (error) {
+                        setHasLoadedGames(true);
                         console.error("讀取錯誤，請確認 Firestore 權限規則設定", error);
                     }
                 };
@@ -274,6 +294,17 @@
                     }
                 }, 100);
             }, []);
+
+            const pendingDelegationClaims = user && accountData.password
+                ? games.filter(game =>
+                    game.delegation?.status === "pending" &&
+                    normalizeEmail(game.delegation.originalEmail) === normalizeEmail(user)
+                )
+                : [];
+
+            useEffect(() => {
+                if (pendingDelegationClaims.length) setShowDelegationInbox(true);
+            }, [user, accountData.password, pendingDelegationClaims.map(game => game.id).join("|")]);
 
             const handleLogin = async () => {
                 const email = normalizeEmail(loginInput);
@@ -466,21 +497,42 @@
                 setIsSavingGame(true);
                 try {
                     const { collection, addDoc } = window.firebaseAPI;
+                    const originalAuthorEmail = normalizeEmail(newGameForm.originalAuthorEmail);
+                    const originalAuthorName = newGameForm.originalAuthorName.trim();
+                    if (newGameForm.isDelegated && originalAuthorEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(originalAuthorEmail)) {
+                        throw new Error("請輸入有效的原作者 Email，或清空帳號並填寫原作者名稱/綽號。");
+                    }
+                    if (newGameForm.isDelegated && originalAuthorEmail === normalizeEmail(user)) {
+                        throw new Error("原作者帳號不可與代發者相同。");
+                    }
+                    if (newGameForm.isDelegated && !originalAuthorEmail && !originalAuthorName) {
+                        throw new Error("代發時請填原作者帳號或名稱/綽號。");
+                    }
                     const gameData = {
                         title: newGameForm.title,
-                        url: newGameForm.url,
+                        url: normalizeSiteUrl(newGameForm.url),
+                        type: newGameForm.type,
                         image: await uploadGameImage(newGameForm.imageFile) || 'https://images.unsplash.com/photo-1550745165-9bc0b252726f?w=500&q=80',
                         description: newGameForm.description,
                         authorKeywords: newGameForm.authorKeywords.split(/[,，]/).map(k => k.trim()).filter(k => k),
                         playerKeywords: [],
                         comments: [],
                         author: accountData.nickname || user,
-                        authorEmail: user
+                        authorEmail: user,
+                        ...(newGameForm.isDelegated ? {
+                            delegation: {
+                                status: originalAuthorEmail ? "pending" : "unclaimed",
+                                delegateEmail: normalizeEmail(user),
+                                delegateName: accountData.nickname || user,
+                                originalEmail: originalAuthorEmail,
+                                originalName: originalAuthorName
+                            }
+                        } : {})
                     };
                     const docRef = await addDoc(collection(window.firebaseDB, "games"), gameData);
                     setGames([{ id: docRef.id, ...gameData }, ...games]);
                     setShowAddGame(false);
-                    setNewGameForm({ title: '', url: '', image: '', imageFile: null, description: '', authorKeywords: '' });
+                    setNewGameForm({ title: '', url: '', type: 'game', image: '', imageFile: null, description: '', authorKeywords: '', isDelegated: false, originalAuthorEmail: '', originalAuthorName: '' });
                 } catch (error) {
                     console.error("發佈遊戲失敗", error);
                     alert(`發佈失敗：${error.message || "請確認 Cloudinary preset 與 Firestore 權限。"}`);
@@ -495,6 +547,7 @@
                     id: activeGame.id,
                     title: activeGame.title,
                     url: activeGame.url,
+                    type: activeGame.type || "game",
                     image: activeGame.image,
                     imageFile: null,
                     description: activeGame.description,
@@ -511,7 +564,8 @@
                     const { doc, updateDoc } = window.firebaseAPI;
                     const updatedData = {
                         title: editGameForm.title,
-                        url: editGameForm.url,
+                        url: normalizeSiteUrl(editGameForm.url),
+                        type: editGameForm.type,
                         image: await uploadGameImage(editGameForm.imageFile) || editGameForm.image || 'https://images.unsplash.com/photo-1550745165-9bc0b252726f?w=500&q=80',
                         description: editGameForm.description,
                         authorKeywords: editGameForm.authorKeywords.split(/[,，]/).map(k => k.trim()).filter(k => k)
@@ -589,6 +643,51 @@
                 }
             };
 
+            const handleDelegationDecision = async (game, accept) => {
+                if (!user || !accountData.password) return;
+                setIsHandlingDelegation(true);
+                try {
+                    const { doc, runTransaction } = window.firebaseAPI;
+                    const gameRef = doc(window.firebaseDB, "games", game.id);
+                    const result = await runTransaction(window.firebaseDB, async transaction => {
+                        const snapshot = await transaction.get(gameRef);
+                        if (!snapshot.exists()) throw new Error("找不到這個網站，請重新整理。");
+
+                        const currentGame = snapshot.data();
+                        const delegation = currentGame.delegation;
+                        if (
+                            delegation?.status !== "pending" ||
+                            normalizeEmail(delegation.originalEmail) !== normalizeEmail(user)
+                        ) {
+                            throw new Error("此代發接收邀請已失效或不屬於目前帳號。");
+                        }
+
+                        const nextDelegation = {
+                            ...delegation,
+                            status: accept ? "accepted" : "declined",
+                            ...(accept ? { acceptedAt: Date.now() } : { declinedAt: Date.now() })
+                        };
+                        const update = {
+                            delegation: nextDelegation,
+                            ...(accept ? {
+                                author: accountData.nickname || delegation.originalName || user,
+                                authorEmail: normalizeEmail(user)
+                            } : {})
+                        };
+                        transaction.update(gameRef, update);
+                        return { ...currentGame, ...update };
+                    });
+
+                    setGames(games.map(item => item.id === game.id ? { ...item, ...result } : item));
+                    if (activeGame?.id === game.id) setActiveGame({ ...activeGame, ...result });
+                } catch (error) {
+                    console.error("處理代發邀請失敗", error);
+                    alert(`處理失敗：${error.message || "請確認 Firestore 權限後重試。"}`);
+                } finally {
+                    setIsHandlingDelegation(false);
+                }
+            };
+
             const handleAddReply = async (gameId, parentCommentId, text) => {
                 const newComment = {
                     id: Date.now().toString() + Math.random().toString(36).substr(2, 5),
@@ -632,26 +731,28 @@
             };
 
             const getSearchResults = () => {
-                if (!searchQuery) return { byName: games, byAuthorKw: [], byPlayerKw: [], byDesc: [] };
+                const categoryGames = games.filter(game => (game.type || "game") === activeTab);
+                if (!searchQuery) return { byName: categoryGames, byAuthorKw: [], byPlayerKw: [], byDesc: [] };
                 const q = searchQuery.toLowerCase();
                 return {
-                    byName: games.filter(g => g.title.toLowerCase().includes(q)),
-                    byAuthorKw: games.filter(g => (g.authorKeywords||[]).some(k => k.toLowerCase().includes(q))),
-                    byPlayerKw: games.filter(g => (g.playerKeywords||[]).some(k => k.toLowerCase().includes(q))),
-                    byDesc: games.filter(g => g.description.toLowerCase().includes(q))
+                    byName: categoryGames.filter(g => g.title.toLowerCase().includes(q)),
+                    byAuthorKw: categoryGames.filter(g => (g.authorKeywords||[]).some(k => k.toLowerCase().includes(q))),
+                    byPlayerKw: categoryGames.filter(g => (g.playerKeywords||[]).some(k => k.toLowerCase().includes(q))),
+                    byDesc: categoryGames.filter(g => g.description.toLowerCase().includes(q))
                 };
             };
             const searchResults = getSearchResults();
+            const visibleGames = games.filter(game => (game.type || "game") === activeTab);
 
             return (
                 <div className="max-w-5xl mx-auto p-4">
                     <nav className="bg-white p-4 rounded-lg shadow mb-6 flex flex-col md:flex-row justify-between items-center gap-4">
-                        <h1 className="text-2xl font-bold text-blue-600 cursor-pointer" onClick={() => setActiveGame(null)}>🎮 遊戲分享網</h1>
+                        <h1 className="text-2xl font-bold text-blue-600 cursor-pointer" onClick={() => setActiveGame(null)}>網站分享平台</h1>
                         
                         {!activeGame && (
                             <input 
                                 type="text" 
-                                placeholder="搜尋遊戲、關鍵字或簡介..." 
+                                placeholder="搜尋網站、關鍵字或簡介..." 
                                 className="border p-2 rounded w-full md:w-1/3"
                                 value={searchQuery}
                                 onChange={e => setSearchQuery(e.target.value)}
@@ -659,7 +760,12 @@
                         )}
 
                         <div className="flex items-center gap-4">
-                            {user && <button onClick={() => setShowAddGame(true)} className="bg-green-500 text-white px-4 py-2 rounded text-sm">發佈遊戲</button>}
+                            {user && pendingDelegationClaims.length > 0 && (
+                                <button onClick={() => setShowDelegationInbox(true)} className="bg-amber-100 text-amber-800 px-3 py-2 rounded text-sm">
+                                    待處理代發（{pendingDelegationClaims.length}）
+                                </button>
+                            )}
+                            {user && <button onClick={() => setShowAddGame(true)} className="bg-green-500 text-white px-4 py-2 rounded text-sm">發佈網站</button>}
                             
                             {user ? (
                                 <>
@@ -689,14 +795,52 @@
                         </div>
                     </nav>
 
-                    {/* 發佈遊戲彈跳視窗 */}
+                    {!activeGame && (
+                        <div className="flex gap-2 mb-6" role="tablist" aria-label="網站分類">
+                            <button
+                                type="button"
+                                role="tab"
+                                aria-selected={activeTab === "game"}
+                                onClick={() => setActiveTab("game")}
+                                className={`px-4 py-2 rounded ${activeTab === "game" ? "bg-blue-600 text-white" : "bg-white text-gray-700"}`}
+                            >
+                                遊戲網站
+                            </button>
+                            <button
+                                type="button"
+                                role="tab"
+                                aria-selected={activeTab === "function"}
+                                onClick={() => setActiveTab("function")}
+                                className={`px-4 py-2 rounded ${activeTab === "function" ? "bg-blue-600 text-white" : "bg-white text-gray-700"}`}
+                            >
+                                功能網站
+                            </button>
+                        </div>
+                    )}
+
+                    {/* 發佈網站彈跳視窗 */}
                     {showAddGame && (
                         <div className="fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center p-4 z-50">
                             <div className="bg-white p-6 rounded-lg w-full max-w-md">
-                                <h2 className="text-xl font-bold mb-4">發佈新遊戲</h2>
+                                <h2 className="text-xl font-bold mb-4">發佈新網站</h2>
                                 <form onSubmit={submitNewGame} className="space-y-3">
-                                    <input required placeholder="遊戲名稱" className="border p-2 w-full rounded" value={newGameForm.title} onChange={e=>setNewGameForm({...newGameForm, title: e.target.value})} />
-                                    <input required placeholder="遊戲網址 (URL)" className="border p-2 w-full rounded" value={newGameForm.url} onChange={e=>setNewGameForm({...newGameForm, url: e.target.value})} />
+                                    <input required placeholder="網站名稱" className="border p-2 w-full rounded" value={newGameForm.title} onChange={e=>setNewGameForm({...newGameForm, title: e.target.value})} />
+                                    <input required type="text" placeholder="網站網址（支援 Gemini 分享網址）" className="border p-2 w-full rounded" value={newGameForm.url} onChange={e=>setNewGameForm({...newGameForm, url: e.target.value})} />
+                                    <select className="border p-2 w-full rounded" value={newGameForm.type} onChange={e=>setNewGameForm({...newGameForm, type: e.target.value})}>
+                                        <option value="game">遊戲網站</option>
+                                        <option value="function">功能網站</option>
+                                    </select>
+                                    <label className="flex items-center gap-2 text-sm">
+                                        <input type="checkbox" checked={newGameForm.isDelegated} onChange={e=>setNewGameForm({...newGameForm, isDelegated: e.target.checked})} />
+                                        這是代發網站
+                                    </label>
+                                    {newGameForm.isDelegated && (
+                                        <div className="space-y-2 rounded border border-amber-200 bg-amber-50 p-3">
+                                            <p className="text-sm text-amber-800">代發期間由你管理；原作者接收後，管理權會轉給原作者。</p>
+                                            <input type="email" placeholder="原作者帳號（知道時填寫）" className="border p-2 w-full rounded" value={newGameForm.originalAuthorEmail} onChange={e=>setNewGameForm({...newGameForm, originalAuthorEmail: e.target.value})} />
+                                            <input placeholder={newGameForm.originalAuthorEmail ? "原作者名稱/綽號（選填）" : "原作者名稱/綽號（不知道帳號時必填）"} className="border p-2 w-full rounded" value={newGameForm.originalAuthorName} onChange={e=>setNewGameForm({...newGameForm, originalAuthorName: e.target.value})} />
+                                        </div>
+                                    )}
                                     <ImageUploadField inputId="new-game-image" file={newGameForm.imageFile} currentImage={newGameForm.image} onFileChange={imageFile => setNewGameForm({...newGameForm, imageFile})} />
                                     <textarea required placeholder="遊戲簡介" className="border p-2 w-full rounded h-24" value={newGameForm.description} onChange={e=>setNewGameForm({...newGameForm, description: e.target.value})} />
                                     <input placeholder="作者關鍵字 (用逗號分隔)" className="border p-2 w-full rounded" value={newGameForm.authorKeywords} onChange={e=>setNewGameForm({...newGameForm, authorKeywords: e.target.value})} />
@@ -713,10 +857,14 @@
                     {showEditGame && (
                         <div className="fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center p-4 z-50">
                             <div className="bg-white p-6 rounded-lg w-full max-w-md">
-                                <h2 className="text-xl font-bold mb-4">編輯遊戲</h2>
+                                <h2 className="text-xl font-bold mb-4">編輯網站</h2>
                                 <form onSubmit={submitEditGame} className="space-y-3">
-                                    <input required placeholder="遊戲名稱" className="border p-2 w-full rounded" value={editGameForm.title} onChange={e=>setEditGameForm({...editGameForm, title: e.target.value})} />
-                                    <input required placeholder="遊戲網址 (URL)" className="border p-2 w-full rounded" value={editGameForm.url} onChange={e=>setEditGameForm({...editGameForm, url: e.target.value})} />
+                                    <input required placeholder="網站名稱" className="border p-2 w-full rounded" value={editGameForm.title} onChange={e=>setEditGameForm({...editGameForm, title: e.target.value})} />
+                                    <input required type="text" placeholder="網站網址（支援 Gemini 分享網址）" className="border p-2 w-full rounded" value={editGameForm.url} onChange={e=>setEditGameForm({...editGameForm, url: e.target.value})} />
+                                    <select className="border p-2 w-full rounded" value={editGameForm.type} onChange={e=>setEditGameForm({...editGameForm, type: e.target.value})}>
+                                        <option value="game">遊戲網站</option>
+                                        <option value="function">功能網站</option>
+                                    </select>
                                     <ImageUploadField inputId="edit-game-image" file={editGameForm.imageFile} currentImage={editGameForm.image} onFileChange={imageFile => setEditGameForm({...editGameForm, imageFile})} />
                                     <textarea required placeholder="遊戲簡介" className="border p-2 w-full rounded h-24" value={editGameForm.description} onChange={e=>setEditGameForm({...editGameForm, description: e.target.value})} />
                                     <input placeholder="作者關鍵字 (用逗號分隔)" className="border p-2 w-full rounded" value={editGameForm.authorKeywords} onChange={e=>setEditGameForm({...editGameForm, authorKeywords: e.target.value})} />
@@ -725,6 +873,30 @@
                                         <button type="submit" disabled={isSavingGame} className="bg-yellow-500 text-white px-4 py-2 rounded disabled:opacity-50">{isSavingGame ? "圖片上傳中..." : "儲存變更"}</button>
                                     </div>
                                 </form>
+                            </div>
+                        </div>
+                    )}
+
+                    {showDelegationInbox && pendingDelegationClaims.length > 0 && (
+                        <div className="fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center p-4 z-[60]">
+                            <div className="bg-white p-6 rounded-lg w-full max-w-lg max-h-[85vh] overflow-y-auto">
+                                <h2 className="text-xl font-bold mb-2">代發網站接收邀請</h2>
+                                <p className="text-sm text-amber-700 mb-4">接收後，網站管理權會轉給你，代發者將不再有編輯權。請確認你認識代發者和網站。此頁的 Email/密碼登入並非 Firebase 身分驗證，無法安全防止冒用。</p>
+                                <div className="space-y-4">
+                                    {pendingDelegationClaims.map(game => (
+                                        <div key={game.id} className="border rounded p-3">
+                                            <h3 className="font-semibold">{game.title}</h3>
+                                            <p className="text-sm text-gray-600">代發者：{game.delegation.delegateName || game.author}</p>
+                                            <div className="flex justify-end gap-2 mt-3">
+                                                <button type="button" disabled={isHandlingDelegation} onClick={() => handleDelegationDecision(game, false)} className="bg-gray-200 px-3 py-2 rounded disabled:opacity-50">拒絕</button>
+                                                <button type="button" disabled={isHandlingDelegation} onClick={() => handleDelegationDecision(game, true)} className="bg-blue-600 text-white px-3 py-2 rounded disabled:opacity-50">接收並取得管理權</button>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                                <div className="text-right mt-4">
+                                    <button type="button" onClick={() => setShowDelegationInbox(false)} className="text-blue-600 hover:underline">稍後處理</button>
+                                </div>
                             </div>
                         </div>
                     )}
@@ -793,16 +965,33 @@
                             <div className="flex justify-between items-start mb-2">
                                 <div>
                                     <h2 className="text-3xl font-bold">{activeGame.title}</h2>
-                                    <p className="text-sm text-gray-500 mt-1">發佈者：{activeGame.author || '匿名'}</p>
+                                    <p className="text-sm text-gray-500 mt-1">
+                                        {activeGame.delegation ? (
+                                            <>
+                                                <span className="font-semibold text-amber-700">代發網站</span>
+                                                {" · "}代發者：{activeGame.delegation.delegateName || activeGame.author || "匿名"}
+                                                {" · "}原作者：{activeGame.delegation.originalName || activeGame.delegation.originalEmail || "未提供"}
+                                                {activeGame.delegation.status === "pending" && "（等待原作者接收）"}
+                                                {activeGame.delegation.status === "accepted" && "（原作者已接收）"}
+                                                {activeGame.delegation.status === "declined" && "（原作者已拒絕接收）"}
+                                            </>
+                                        ) : `發佈者：${activeGame.author || '匿名'}`}
+                                    </p>
                                 </div>
                                 <div className="flex gap-2">
-                                    <a href={activeGame.url} target="_blank" className="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600 text-center">開始遊玩</a>
+                                    <a href={activeGame.url} target="_blank" rel="noopener noreferrer" className="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600 text-center">{(activeGame.type || "game") === "game" ? "開始遊玩" : "開啟網站"}</a>
                                     {/* 只有作者能看到編輯按鈕 */}
-                                    {user && normalizeEmail(user) === normalizeEmail(activeGame.authorEmail || activeGame.author) && (
-                                        <button onClick={openEditModal} className="bg-yellow-500 text-white px-4 py-2 rounded hover:bg-yellow-600">編輯遊戲</button>
+                                    {user && normalizeEmail(user) === getListingManagerEmail(activeGame) && (
+                                        <button onClick={openEditModal} className="bg-yellow-500 text-white px-4 py-2 rounded hover:bg-yellow-600">編輯網站</button>
                                     )}
                                 </div>
                             </div>
+                            {activeGame.delegation?.status === "pending" && (
+                                <p className="text-sm text-amber-700 mb-3">目前由代發者管理；原作者登入具有密碼值的帳號後，可選擇是否接收管理權。此頁登入無法安全驗證身分。</p>
+                            )}
+                            {activeGame.delegation?.status === "unclaimed" && (
+                                <p className="text-sm text-amber-700 mb-3">此網站由 {activeGame.delegation.originalName} 委託代發，原作者帳號未提供，因此目前由代發者管理。</p>
+                            )}
                             
                             <div className="mb-4 mt-4">
                                 <h3 className="font-bold text-gray-700">簡介：</h3>
@@ -856,17 +1045,17 @@
                         <div>
                             {searchQuery ? (
                                 <div className="space-y-6">
-                                    {searchResults.byName.length > 0 && <ResultSection title="🎯 遊戲名稱相符" games={searchResults.byName} onSelect={setActiveGame} />}
+                                    {searchResults.byName.length > 0 && <ResultSection title="🎯 網站名稱相符" games={searchResults.byName} onSelect={setActiveGame} />}
                                     {searchResults.byAuthorKw.length > 0 && <ResultSection title="🏷️ 作者關鍵字相符" games={searchResults.byAuthorKw} onSelect={setActiveGame} />}
                                     {searchResults.byPlayerKw.length > 0 && <ResultSection title="🎮 玩家關鍵字相符" games={searchResults.byPlayerKw} onSelect={setActiveGame} />}
                                     {searchResults.byDesc.length > 0 && <ResultSection title="📖 簡介相符" games={searchResults.byDesc} onSelect={setActiveGame} />}
                                     {Object.values(searchResults).every(arr => arr.length === 0) && <p className="text-center text-gray-500 mt-10">找不到相關遊戲</p>}
                                 </div>
                             ) : (
-                                <ResultSection title="🌟 遊戲列表" games={games} onSelect={setActiveGame} />
+                                <ResultSection title={activeTab === "game" ? "🌟 遊戲網站" : "🧰 功能網站"} games={visibleGames} onSelect={setActiveGame} />
                             )}
-                            {games.length === 0 && !searchQuery && (
-                                <div className="text-center text-gray-500 mt-20">資料庫目前沒有遊戲，請登入後點擊右上角「發佈遊戲」來新增。</div>
+                            {visibleGames.length === 0 && !searchQuery && (
+                                <div className="text-center text-gray-500 mt-20">{hasLoadedGames ? "此分頁目前沒有網站。" : "正在載入網站..."}</div>
                             )}
                         </div>
                     )}
@@ -883,7 +1072,12 @@
                             <img src={game.image} className="w-full h-40 object-cover" />
                             <div className="p-4 flex flex-col flex-grow">
                                 <h3 className="font-bold text-lg">{game.title}</h3>
-                                <p className="text-xs text-blue-500 mb-2">發佈者: {game.author || '匿名'}</p>
+                                <p className="text-xs text-blue-500 mb-2">
+                                    {game.delegation
+                                        ? `代發網站 · 代發者: ${game.delegation.delegateName || game.author || '匿名'}`
+                                        : `發佈者: ${game.author || '匿名'}`}
+                                </p>
+                                <p className="text-xs text-gray-500 mb-2">{(game.type || "game") === "game" ? "遊戲網站" : "功能網站"}</p>
                                 <p className="text-sm text-yellow-600 mb-2">
                                     ★ {getRatingStats(game.ratings).count
                                         ? `${getRatingStats(game.ratings).average.toFixed(1)}（${getRatingStats(game.ratings).count} 人）`
